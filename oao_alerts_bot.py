@@ -8,6 +8,10 @@ from astropy.coordinates import SkyCoord, EarthLocation, AltAz
 from astropy.time import Time
 import astropy.units as u
 from astroplan import Observer
+from alerce.core import Alerce
+
+alerce_client = Alerce()
+
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -89,21 +93,26 @@ def evaluar_visibilidad_oao(ra_deg, dec_deg):
 
 def obtener_datos_alerce_detallados(oid):
     try:
-        r_obj = requests.get(f"https://alerce.online{oid}", timeout=10)
-        obj_data = r_obj.json()
-        r_det = requests.get(f"https://alerce.online{oid}/detections", timeout=10)
-        detecciones = r_det.json()
-    except Exception:
-        return None, [], None
+        obj_df = alerce_client.query_objects(oid=oid, format="pandas")
+        if obj_df.empty:
+            return None, [], None
+        obj_data = obj_df.iloc[0].to_dict()
 
-    mapa_filtros_ztf = {1: "ZTF-g", 2: "ZTF-r", 3: "ZTF-i"}
-    filtros_obs = sorted(list({mapa_filtros_ztf.get(d.get("fid"), "ZTF-?") for d in detecciones}))
+        det_df = alerce_client.query_detections(oid=oid, format="pandas")
+        mapa_filtros_ztf = {1: "ZTF-g", 2: "ZTF-r", 3: "ZTF-i"}
+        if not det_df.empty and "fid" in det_df.columns:
+            filtros_obs = sorted(list({mapa_filtros_ztf.get(f, "ZTF-?") for f in det_df["fid"].dropna()}))
+        else:
+            filtros_obs = []
+    except Exception as e:
+        print(f"Error consultando detalles de {oid}: {e}")
+        return None, [], None
 
     first_mjd = obj_data.get("firstmjd")
     dias_desde_explosion = None
-    if first_mjd is not None:
+    if first_mjd is not None and not np.isnan(first_mjd):
         ahora_mjd = Time(datetime.now(timezone.utc)).mjd
-        dias_desde_explosion = max(0.1, ahora_mjd - first_mjd)
+        dias_desde_explosion = max(0.1, ahora_mjd - float(first_mjd))
 
     return obj_data, filtros_obs, dias_desde_explosion
 
@@ -218,17 +227,21 @@ def procesar_alertas(db):
         if info.get("activa", False) and (ahora_mjd - info["firstmjd"]) > DIAS_MAX_ACTIVAS:
             info["activa"] = False
 
-    url = "https://alerce.online"
-    params = {
-        "classifier": "lc_classifier", "class": "SN", "probability": 0.6,
-        "firstmjd": ahora_mjd - 5.0, "page_size": 50,
-        "order_by": "lastmjd", "order_mode": "DESC"
-    }
-
     try:
-        candidatos = requests.get(url, params=params, timeout=15).json().get("items", [])
+        df_cand = alerce_client.query_objects(
+            classifier="lc_classifier",
+            class_name="SN",
+            probability=0.6,
+            firstmjd=[ahora_mjd - 5.0, ahora_mjd],
+            page_size=50,
+            order_by="lastmjd",
+            order_mode="DESC",
+            format="pandas"
+        )
+        candidatos = df_cand.to_dict(orient="records") if not df_cand.empty else []
+        print(f"Candidatos encontrados en ALeRCE: {len(candidatos)}")
     except Exception as e:
-        print(f"Error consultando ALeRCE: {e}")
+        print(f"Error consultando lista en ALeRCE: {e}")
         return
 
     for obj in candidatos:
