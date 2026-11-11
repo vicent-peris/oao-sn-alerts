@@ -12,7 +12,6 @@ from alerce.core import Alerce
 
 alerce_client = Alerce()
 
-
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -31,6 +30,13 @@ SNR_OBJETIVO = {
     "CaK": 35.0, "OIII": 35.0, "SII": 35.0, "Ha": 25.0,
     "u": 20.0, "g": 30.0, "r": 30.0, "i": 30.0
 }
+
+def es_valido(valor):
+    if valor is None:
+        return False
+    if isinstance(valor, float) and np.isnan(valor):
+        return False
+    return True
 
 def cargar_config_exposiciones():
     config = {}
@@ -101,7 +107,7 @@ def obtener_datos_alerce_detallados(oid):
         det_df = alerce_client.query_detections(oid=oid, format="pandas")
         mapa_filtros_ztf = {1: "ZTF-g", 2: "ZTF-r", 3: "ZTF-i"}
         if not det_df.empty and "fid" in det_df.columns:
-            filtros_obs = sorted(list({mapa_filtros_ztf.get(f, "ZTF-?") for f in det_df["fid"].dropna()}))
+            filtros_obs = sorted(list({mapa_filtros_ztf.get(int(f), "ZTF-?") for f in det_df["fid"].dropna()}))
         else:
             filtros_obs = []
     except Exception as e:
@@ -110,7 +116,7 @@ def obtener_datos_alerce_detallados(oid):
 
     first_mjd = obj_data.get("firstmjd")
     dias_desde_explosion = None
-    if first_mjd is not None and not np.isnan(first_mjd):
+    if es_valido(first_mjd):
         ahora_mjd = Time(datetime.now(timezone.utc)).mjd
         dias_desde_explosion = max(0.1, ahora_mjd - float(first_mjd))
 
@@ -144,14 +150,17 @@ def consultar_tns_espectros_y_filtros(ra_deg, dec_deg):
         return "Error consulta TNS", 0, []
 def enviar_mensaje(texto):
     url = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "Markdown"})
+    resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "Markdown"})
+    print(f"Respuesta de Telegram ({resp.status_code}): {resp.text}")
 
 def revisar_comandos_pendientes(db):
     offset = db.get("telegram_offset", 0)
     url = f"https://telegram.org{TELEGRAM_TOKEN}/getUpdates"
     try:
         res = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=10).json()
-    except Exception:
+        print(f"Mensajes leídos de Telegram: {res}")
+    except Exception as e:
+        print(f"Error leyendo Telegram: {e}")
         return
 
     pedir_activas = False
@@ -161,9 +170,9 @@ def revisar_comandos_pendientes(db):
         db["telegram_offset"] = update["update_id"] + 1
         msg = update.get("message", {})
         texto = msg.get("text", "").strip().lower()
-        if texto.startswith("/activas"):
+        if "/activas" in texto:
             pedir_activas = True
-        elif texto.startswith("/estado"):
+        elif "/estado" in texto:
             pedir_estado = True
 
     if pedir_activas:
@@ -246,11 +255,11 @@ def procesar_alertas(db):
 
     for obj in candidatos:
         oid = obj.get("oid")
-        if oid in db["supernovas"]:
+        if not oid or oid in db["supernovas"]:
             continue
 
         ra, dec = obj.get("meanra"), obj.get("meandec")
-        if ra is None or dec is None or dec <= -10.0:
+        if not es_valido(ra) or not es_valido(dec) or float(dec) <= -10.0:
             continue
 
         detalles, filtros_ztf, edad_dias = obtener_datos_alerce_detallados(oid)
@@ -260,33 +269,37 @@ def procesar_alertas(db):
         if edad_dias is not None and edad_dias > 5.0:
             continue
 
-        mags_validas = [m for m in (obj.get("last_g"), obj.get("last_r")) if m is not None]
+        mags_validas = [float(m) for m in (obj.get("last_g"), obj.get("last_r")) if es_valido(m)]
         mag_actual = min(mags_validas) if mags_validas else None
         if mag_actual is not None and mag_actual > 17.5:
             continue
 
         ebv = detalles.get("ebv")
-        if ebv is not None and ebv >= 0.25:
+        ebv_val = float(ebv) if es_valido(ebv) else None
+        if ebv_val is not None and ebv_val >= 0.25:
             continue
 
         redshift = detalles.get("z")
-        if redshift is not None and (redshift > 0.027 or redshift <= 0):
+        z_val = float(redshift) if es_valido(redshift) else None
+        if z_val is not None and (z_val > 0.027 or z_val <= 0):
             continue
 
-        horas_utiles, t_ini, t_fin = evaluar_visibilidad_oao(ra, dec)
+        horas_utiles, t_ini, t_fin = evaluar_visibilidad_oao(float(ra), float(dec))
         if horas_utiles < 2.0:
             continue
 
         mag_calculo = mag_actual if mag_actual is not None else 16.5
         tiempos_seg = calcular_tiempos_exposicion(mag_calculo, config_csv)
 
-        nombre_tns, num_espectros, filtros_tns = consultar_tns_espectros_y_filtros(ra, dec)
+        nombre_tns, num_espectros, filtros_tns = consultar_tns_espectros_y_filtros(float(ra), float(dec))
         todos_filtros = sorted(list(set(filtros_ztf + filtros_tns)))
 
+        first_mjd_val = float(detalles["firstmjd"]) if es_valido(detalles.get("firstmjd")) else ahora_mjd
+
         db["supernovas"][oid] = {
-            "oid": oid, "nombre_tns": nombre_tns, "ra": ra, "dec": dec,
-            "firstmjd": detalles.get("firstmjd", ahora_mjd), "mag": mag_actual,
-            "redshift": redshift, "ebv": ebv, "num_espectros": num_espectros,
+            "oid": oid, "nombre_tns": nombre_tns, "ra": float(ra), "dec": float(dec),
+            "firstmjd": first_mjd_val, "mag": mag_actual,
+            "redshift": z_val, "ebv": ebv_val, "num_espectros": num_espectros,
             "filtros_obs": todos_filtros, "activa": True
         }
 
@@ -328,3 +341,5 @@ if __name__ == "__main__":
     revisar_comandos_pendientes(db)
     procesar_alertas(db)
     guardar_db(db)
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        enviar_mensaje("✅ *Prueba manual completada:* El bot de alertas del TURIA-2 está conectado y vigilando.")
