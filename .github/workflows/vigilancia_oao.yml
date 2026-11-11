@@ -1,9 +1,9 @@
 name: Vigilancia Supernovas OAO - TURIA-2
 
 on:
-  schedule:
-    # Se ejecuta cada 30 minutos
-    - cron: '*/30 * * * *'
+    schedule:
+    # Se ejecuta cada 4 horas (a las 00:00, 04:00, 08:00, 12:00, 16:00 y 20:00 UTC)
+    - cron: '0 */4 * * *'
   workflow_dispatch:
     # Permite ejecutarlo manualmente en cualquier momento desde GitHub
 
