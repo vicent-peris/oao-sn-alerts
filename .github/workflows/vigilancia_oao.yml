@@ -25,7 +25,7 @@ jobs:
 
       - name: Instalar dependencias astronómicas
         run: |
-          pip install requests astropy astroplan numpy alerce
+          pip install requests astropy astroplan numpy alerce astroquery
 
       - name: Ejecutar bot de alertas y comandos
         env:
