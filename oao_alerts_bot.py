@@ -1,3 +1,4 @@
+import re
 import os
 import csv
 import json
@@ -9,8 +10,9 @@ from astropy.time import Time
 import astropy.units as u
 from astroplan import Observer
 from alerce.core import Alerce
+from astroquery.ipac.irsa.irsa_dust import IrsaDust
 
-alerce_client = Alerce()
+alerce_client = Alerce(ztf_backend="multisurvey")
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -32,9 +34,13 @@ SNR_OBJETIVO = {
 }
 
 def es_valido(valor):
-    if valor is None:
+    if valor is None or np.ma.is_masked(valor):
         return False
-    if isinstance(valor, float) and np.isnan(valor):
+    try:
+        val_float = float(valor)
+        if np.isnan(val_float):
+            return False
+    except (ValueError, TypeError):
         return False
     return True
 
@@ -97,22 +103,39 @@ def evaluar_visibilidad_oao(ra_deg, dec_deg):
     t_fin = tiempos[indices_utiles[-1]].to_datetime(timezone=OBSERVATORY.timezone).strftime("%H:%M")
     return horas_utiles, t_ini, t_fin
 
+import xml.etree.ElementTree as ET
+
 def obtener_datos_alerce_detallados(oid):
     try:
         obj_df = alerce_client.query_objects(oid=oid, format="pandas")
         if obj_df.empty:
-            return None, [], None
-        obj_data = obj_df.iloc[0].to_dict()
+            return None, [], None, None
+        obj_data = obj_df.to_dict(orient="records")[0]
 
         det_df = alerce_client.query_detections(oid=oid, format="pandas")
-        mapa_filtros_ztf = {1: "ZTF-g", 2: "ZTF-r", 3: "ZTF-i"}
-        if not det_df.empty and "fid" in det_df.columns:
-            filtros_obs = sorted(list({mapa_filtros_ztf.get(int(f), "ZTF-?") for f in det_df["fid"].dropna()}))
-        else:
-            filtros_obs = []
+        mapa_filtros_ztf = {
+            "1": "ZTF-g", "2": "ZTF-r", "3": "ZTF-i",
+            "g": "ZTF-g", "r": "ZTF-r", "i": "ZTF-i",
+            "ztfg": "ZTF-g", "ztfr": "ZTF-r", "ztfi": "ZTF-i"
+        }
+        mag_actual = None
+        filtros_obs = []
+
+        if not det_df.empty:
+            col_filtro = "band" if "band" in det_df.columns else ("fid" if "fid" in det_df.columns else None)
+            if col_filtro:
+                filtros_obs = sorted(list({
+                    mapa_filtros_ztf.get(str(f).strip().lower(), f"ZTF-{f}")
+                    for f in det_df[col_filtro].dropna()
+                }))
+
+            if "magpsf" in det_df.columns and "mjd" in det_df.columns:
+                det_validas = det_df.dropna(subset=["magpsf", "mjd"]).sort_values("mjd", ascending=False)
+                if not det_validas.empty:
+                    mag_actual = float(det_validas["magpsf"].tolist()[0])
     except Exception as e:
         print(f"Error consultando detalles de {oid}: {e}")
-        return None, [], None
+        return None, [], None, None
 
     first_mjd = obj_data.get("firstmjd")
     dias_desde_explosion = None
@@ -120,7 +143,18 @@ def obtener_datos_alerce_detallados(oid):
         ahora_mjd = Time(datetime.now(timezone.utc)).mjd
         dias_desde_explosion = max(0.1, ahora_mjd - float(first_mjd))
 
-    return obj_data, filtros_obs, dias_desde_explosion
+    return obj_data, filtros_obs, dias_desde_explosion, mag_actual
+
+def obtener_polvo_mw_irsa(ra_deg, dec_deg):
+    """Consulta el valor exacto de extinción galáctica E(B-V) (Schlafly & Finkbeiner 2011) mediante astroquery."""
+    try:
+        coord = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+        tabla = IrsaDust.get_query_table(coord, section="ebv")
+        if tabla is not None and len(tabla) > 0:
+            return float(tabla["ext SandF mean"][0])
+    except Exception as e:
+        print(f"Aviso consultando polvo IRSA: {e}")
+    return None
 
 def consultar_tns_espectros_y_filtros(ra_deg, dec_deg):
     if not TNS_API_KEY:
@@ -149,13 +183,13 @@ def consultar_tns_espectros_y_filtros(ra_deg, dec_deg):
     except Exception:
         return "Error consulta TNS", 0, []
 def enviar_mensaje(texto):
-    url = f"https://telegram.org{TELEGRAM_TOKEN}/sendMessage"
+    url = "https://" + "api.telegram.org/bot" + TELEGRAM_TOKEN + "/sendMessage"
     resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "Markdown"})
     print(f"Respuesta de Telegram ({resp.status_code}): {resp.text}")
 
 def revisar_comandos_pendientes(db):
     offset = db.get("telegram_offset", 0)
-    url = f"https://telegram.org{TELEGRAM_TOKEN}/getUpdates"
+    url = "https://" + "api.telegram.org/bot" + TELEGRAM_TOKEN + "/getUpdates"
     try:
         res = requests.get(url, params={"offset": offset, "timeout": 5}, timeout=10).json()
         print(f"Mensajes leídos de Telegram: {res}")
@@ -238,9 +272,9 @@ def procesar_alertas(db):
 
     try:
         df_cand = alerce_client.query_objects(
-            classifier="lc_classifier",
+            classifier="stamp_classifier",
             class_name="SN",
-            probability=0.6,
+            probability=0.5,
             firstmjd=[ahora_mjd - 5.0, ahora_mjd],
             page_size=50,
             order_by="lastmjd",
@@ -262,26 +296,21 @@ def procesar_alertas(db):
         if not es_valido(ra) or not es_valido(dec) or float(dec) <= -10.0:
             continue
 
-        detalles, filtros_ztf, edad_dias = obtener_datos_alerce_detallados(oid)
+        detalles, filtros_ztf, edad_dias, mag_actual = obtener_datos_alerce_detallados(oid)
         if detalles is None:
             continue
 
         if edad_dias is not None and edad_dias > 5.0:
             continue
 
-        mags_validas = [float(m) for m in (obj.get("last_g"), obj.get("last_r")) if es_valido(m)]
-        mag_actual = min(mags_validas) if mags_validas else None
         if mag_actual is not None and mag_actual > 17.5:
             continue
 
-        ebv = detalles.get("ebv")
-        ebv_val = float(ebv) if es_valido(ebv) else None
+        ebv_val = obtener_polvo_mw_irsa(float(ra), float(dec))
         if ebv_val is not None and ebv_val >= 0.25:
             continue
 
-        redshift = detalles.get("z")
-        z_val = float(redshift) if es_valido(redshift) else None
-        if z_val is not None and (z_val > 0.027 or z_val <= 0):
+        if ebv_val is not None and ebv_val >= 0.25:
             continue
 
         horas_utiles, t_ini, t_fin = evaluar_visibilidad_oao(float(ra), float(dec))
@@ -299,7 +328,7 @@ def procesar_alertas(db):
         db["supernovas"][oid] = {
             "oid": oid, "nombre_tns": nombre_tns, "ra": float(ra), "dec": float(dec),
             "firstmjd": first_mjd_val, "mag": mag_actual,
-            "redshift": z_val, "ebv": ebv_val, "num_espectros": num_espectros,
+            "ebv": ebv_val, "num_espectros": num_espectros,
             "filtros_obs": todos_filtros, "activa": True
         }
 
@@ -309,7 +338,6 @@ def enviar_ficha_telegram(sn, edad_dias, horas_utiles, ventana, tiempos_seg):
     coord_str = SkyCoord(ra=sn["ra"] * u.deg, dec=sn["dec"] * u.deg).to_string("hmsdms", sep=":")
     edad_str = f"{edad_dias:.1f} días" if edad_dias is not None else "Desconocida (Dato nulo)"
     mag_str = f"{sn['mag']:.2f} mag" if sn["mag"] is not None else "Sin dato (Calculado a 16.5)"
-    dist_str = f"{(sn['redshift'] * 299792.458 / 70.0):.1f} Mpc" if sn["redshift"] else "Desconocida"
     ebv_str = f"{sn['ebv']:.3f}" if sn["ebv"] is not None else "Desconocido"
     esp_str = f"Sí ({sn['num_espectros']} en TNS)" if sn["num_espectros"] > 0 else "No todavía"
     filtros_str = ", ".join(sn["filtros_obs"]) if sn["filtros_obs"] else "Ninguno registrado"
@@ -319,22 +347,25 @@ def enviar_ficha_telegram(sn, edad_dias, horas_utiles, ventana, tiempos_seg):
     t_g = tiempos_seg["g"] / 60.0
     t_sho = tiempos_seg["OIII"] / 60.0
 
+    enlace_alerce = "https://" + "alerce.online" + "/object/" + sn["oid"]
+
     mensaje = (
         f"🚨 *ALERTA SUPERNOVA - OAO (TURIA-2)* 🚨\n\n"
         f"🔭 *ID:* `{sn['oid']}` ({sn['nombre_tns']})\n"
         f"📍 *Coord (J2000):* `{coord_str}`\n"
         f"⏳ *Tiempo desde explosión:* *{edad_str}*\n"
         f"✨ *Magnitud:* {mag_str}\n"
-        f"🌌 *Distancia est.:* {dist_str} | *Polvo MW:* {ebv_str}\n"
+        f"🌫️ *Polvo MW E(B-V):* {ebv_str}\n"
         f"🧬 *Espectro público:* {esp_str}\n"
         f"🎨 *Filtros ya observados:* {filtros_str}\n\n"
         f"⏱️ *Visibilidad OAO (>30°):* *{horas_utiles:.1f} h* ({ventana} CET)\n"
         f"📸 *Tiempos guía (según CSV):*\n"
         f"   • Prioridad temprana: *u:* {t_u:.0f} min | *g:* {t_g:.0f} min | *CaK:* {t_cak:.0f} min\n"
         f"   • Bandas estrechas (3nm): *SHO:* {t_sho:.0f} min c/u\n\n"
-        f"🔗 [Ficha en ALeRCE](https://alerce.online{sn['oid']})"
+        f"🔗 [Ficha en ALeRCE]({enlace_alerce})"
     )
     enviar_mensaje(mensaje)
+
 
 if __name__ == "__main__":
     db = cargar_db()
