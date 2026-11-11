@@ -1,0 +1,45 @@
+name: Vigilancia Supernovas OAO - TURIA-2
+
+on:
+  schedule:
+    # Se ejecuta cada 30 minutos
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    # Permite ejecutarlo manualmente en cualquier momento desde GitHub
+
+permissions:
+  contents: write  # Necesario para guardar el historial JSON en el repo
+
+jobs:
+  rastreo-alertas:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar dependencias astronómicas
+        run: |
+          pip install requests astropy astroplan numpy
+
+      - name: Ejecutar bot de alertas y comandos
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TNS_API_KEY: ${{ secrets.TNS_API_KEY }}
+          TNS_BOT_ID: ${{ secrets.TNS_BOT_ID }}
+          TNS_BOT_NAME: ${{ secrets.TNS_BOT_NAME }}
+        run: |
+          python oao_alerts_bot.py
+
+      - name: Guardar estado de seguimiento en el repositorio
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "OAO Alert Bot"
+          git add supernovas_seguimiento.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Actualización automática de seguimiento SN" && git push)
